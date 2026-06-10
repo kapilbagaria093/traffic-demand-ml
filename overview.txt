@@ -1,0 +1,78 @@
+Traffic Demand Prediction - Solution Architecture & Approach
+Overview
+This repository contains the solution for predicting urban traffic demand based on spatial, temporal, and environmental factors. The final pipeline utilizes a robust feature engineering strategy, out-of-fold spatial-temporal target encoding, and an Optuna-tuned ensemble of LightGBM and CatBoost models.
+This approach successfully handles the high cardinality of geographic data and the cyclical nature of time, yielding a highly competitive R² score.
+
+
+1. Feature Engineering:
+
+The core of this solution relies on extracting meaningful patterns from the raw timestamp and geohash features.
+Temporal Features
+• Time Components: Extracted hour and minute from the timestamp, and calculated absolute time_in_mins (total minutes from midnight).
+• Cyclical Encoding: Because time is continuous (23:59 is mathematically adjacent to 00:00), hour and time_in_mins were transformed using Sine and Cosine waves. This prevents tree-based models from incorrectly splitting late-night and early-morning hours into extreme opposites.
+• Domain-Specific Flags: Created binary indicators for traffic phases:
+o is_rush_am (07:00 - 09:00)
+o is_rush_pm (17:00 - 19:00)
+o is_biz (09:00 - 17:00)
+o is_night (22:00 - 05:00)
+• Weekly Cycles: Extracted day_mod7 to represent the day of the week, allowing the model to distinguish between weekday and weekend traffic patterns.
+Spatial Features
+• Coordinate Decoding: The geohash strings were mathematically decoded into exact continuous latitude and longitude float values, giving the tree models explicit bounding-box capabilities.
+• Geohash Hierarchy: Extracted string prefixes (geo5, geo4) to create varying zoom levels of geographic grouping (neighborhood level vs. city district level).
+
+
+2. Target Transformation
+The distribution of the traffic demand variable is highly right-skewed. To stabilize variance and optimize the model's ability to learn, the target variable was transformed using Log1p(np.log1p(demand)).
+All model training was conducted on this normalized log scale. During the final inference phase, predictions were reverted to their original scale using Expm1 (np.expm1(preds)).
+
+
+3. Leak-Free Target Encoding
+Because geohash has over 1,200 unique categorical values, standard label encoding is insufficient. We utilized a Spatial-Temporal Target Encoding strategy:
+1. 5-Fold Cross-Validation: To prevent target leakage, the data was split into 5 folds. The mean demand for a specific geohash was calculated on 4 folds and mapped to the 5th out-of-fold (OOF) validation set.
+2. Hierarchical Fallback Logic: We encoded combinations of features starting from the most granular to the most broad. If a specific combination was unseen in the training fold, it gracefully fell back to a broader average:
+o Level 1 (Most Granular): [geohash, hour] mean demand.
+o Level 2: [geohash] mean demand.
+o Level 3: [geo5] mean demand.
+o Level 4: [geo4] mean demand.
+o Level 5 (Global Fallback): Overall global training mean.
+
+
+4. Feature Selection
+Through rigorous local cross-validation, certain features were found to introduce noise or multicollinearity. The following features were intentionally dropped from the final training set to maximize the OOF R² score:
+• feat_geo4
+• geo4
+• day_mod7
+Categorical columns such as RoadType, LargeVehicles, Landmarks, and Weather were factorized into integers to allow the models to process them natively.
+
+
+5. Modeling & Ensembling
+The final predictive engine is a weighted blend of two highly optimized gradient boosting models. Both models were tuned extensively using Optuna.
+Model 1: LightGBM Regressor
+• Strengths: Exceptionally fast, handles dense tabular data well, and captures complex feature interactions via leaf-wise growth.
+• Key Hyperparameters:
+o learning_rate: ~0.0289
+o num_leaves: 1844 (Allowed deep, complex interactions)
+o feature_fraction: ~0.82
+o bagging_fraction: ~0.97
+o n_estimators: 4611
+Model 2: CatBoost Regressor
+• Strengths: Superior native handling of categorical features and highly resistant to overfitting on specific target encodings.
+• Key Hyperparameters:
+o learning_rate: 0.04
+o depth: 8
+o iterations: 2000
+The Ensemble Blend
+The predictions from both models were combined using a weighted average derived from Optuna optimization:
+• LightGBM Weight: ~41.8%
+• CatBoost Weight: ~58.2%
+6. Post-Processing
+After blending the exponential predictions, two final steps were applied:
+1. Heuristic Shifting: Tree models trained on log-transformed data inherently predict the median rather than the mean, leading to slight under-predictions on the extreme high end. A targeted manual shift was applied: predictions > 0.8 were adjusted by +0.06, and predictions > 0.2 were adjusted by -0.012.
+2. Clipping: All final predictions were bounded np.clip(preds, 0, 1) to ensure no negative or physically impossible demand values were submitted.
+
+
+7. Requirements & Reproducibility
+To reproduce the pipeline, ensure the following libraries are installed:
+Bash
+pip install pandas numpy scikit-learn lightgbm catboost optuna matplotlib seaborn
+
